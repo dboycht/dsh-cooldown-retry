@@ -1,0 +1,11 @@
+# Normalize line endings in the repository, whatever the contributor's platform.
+# Without this, a Windows checkout rewrites every text file to CRLF and the diff
+# noise buries the actual change.
+* text=auto eol=lf
+
+# Keep binary assets byte-exact.
+*.png binary
+*.jpg binary
+*.gif binary
+*.webp binary
+*.ico binary

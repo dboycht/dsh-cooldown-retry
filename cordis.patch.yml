@@ -1,0 +1,20 @@
+# dsh-cooldown-retry bundle patch: adds the cooldown-retry row to whatever
+# profile installs this package. Applied as a bundle layer (dsh.bundle.patch)
+# after dsh-base, so the row lands beside the other agent rows.
+#
+# `name` is this package's own name. A bare specifier is resolved by Node from
+# the profile directory — which is exactly where `dsh plugin add` installs it —
+# so this row keeps working no matter where the package lives on disk.
+#
+# No `config` here on purpose: the plugin's built-in defaults are
+#   maxRetries 5 / minDelayMs 1000 / maxDelayMs 300000
+# To change them, target this row's id from your own profile or home
+# cordis.patch.yml (a non-insert patch replaces the row's whole config, so
+# restate every key you want to keep):
+#
+#   - id: cooldown-retry
+#     config:
+#       maxRetries: 10
+- insert:
+    - id: cooldown-retry
+      name: dsh-cooldown-retry

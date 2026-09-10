@@ -1,0 +1,54 @@
+{
+  "name": "dsh-cooldown-retry",
+  "version": "1.0.0",
+  "description": "Patient auto-retry for DeepSeek Harness: honor the upstream gateway's retry_after_seconds on a 429 capacity cooldown instead of giving up after two fast retries. Optional floating countdown badge included.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "dynamic",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dboycht/dsh-cooldown-retry.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dboycht/dsh-cooldown-retry/issues"
+  },
+  "homepage": "https://github.com/dboycht/dsh-cooldown-retry#readme",
+  "author": "dboycht",
+  "license": "MIT",
+  "keywords": [
+    "deepseek-harness",
+    "deepseek",
+    "dsh",
+    "cordis",
+    "plugin",
+    "retry",
+    "retry-after",
+    "429",
+    "rate-limit",
+    "cooldown",
+    "llm-gateway"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
