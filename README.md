@@ -25,13 +25,15 @@ Reading the hint out of the message and then waiting as long as the upstream ask
 
 |  | built-in `llm-retry` (no usable hint) | `dsh-cooldown-retry` |
 |---|---|---|
-| Attempts per turn/step/provider | 2 | 5 |
+| Attempts per turn/provider | 2 | 5 |
 | Backoff | fixed ~500 ms → 1 s | the upstream's own `retry_after_seconds` |
 | Delay window | — | clamped to 1 s … 300 s |
 | Abort-aware | — | yes — a cancelled turn ends the wait immediately |
-| Hints parsed | — | `providerRetryAfterMs`, `retry_after_seconds`, `retry_after_ms`, prose `retry after N` |
+| Hints parsed | — | `providerRetryAfterMs`, `retryAfter`, `retry_after_seconds`, `retry_after_ms`, prose `retry after N` |
 
 It takes over **only** failures that both look like a capacity cooldown *and* carry a retry hint. Everything else is handed to the next listener with `next()`, so auth errors, network errors, and hint-less 429s keep their built-in behavior.
+
+The budget is counted **per turn and provider**, not per step: a multi-step turn that trips the same cooldown in every step shares one budget instead of getting a fresh five in each. A new turn resets it.
 
 ## Install
 
@@ -59,7 +61,7 @@ Put that in your home-level `$DSH_HOME/cordis.patch.yml` (every profile) or a pr
 
 ## Configure
 
-Defaults are `maxRetries: 5`, `minDelayMs: 1000`, `maxDelayMs: 300000`. Override them from your own patch layer:
+Defaults are `maxRetries: 5`, `minDelayMs: 1000`, `maxDelayMs: 300000`, `acrossSteps: true`, `hintlessBackoff: false`, `hintlessBaseDelayMs: 5000`. Override them from your own patch layer:
 
 ```yaml
 - id: cooldown-retry
@@ -68,7 +70,33 @@ Defaults are `maxRetries: 5`, `minDelayMs: 1000`, `maxDelayMs: 300000`. Override
     maxDelayMs: 600000
 ```
 
-A non-`insert` patch replaces the targeted row's **whole** `config`, so restate every key you want to keep. Unusable values are ignored in favour of the defaults, and an inverted window is repaired rather than accepted.
+A non-`insert` patch replaces the targeted row's **whole** `config`, so restate every key you want to keep. Unusable values are ignored in favour of the defaults, and an inverted window is repaired rather than accepted. `maxRetries` is capped at 100.
+
+| Key | Meaning |
+|---|---|
+| `maxRetries` | Patient retries per turn/provider before handing the failure downstream. |
+| `minDelayMs` / `maxDelayMs` | The window every wait is clamped into. |
+| `acrossSteps` | `true` (default) shares one budget across the steps of a turn; `false` restores a budget per turn/step. |
+| `hintlessBackoff` | Also take over a capacity cooldown that carries **no** hint, using `hintlessBaseDelayMs * 2^(attempt-1)`. Off by default: hint-less throttling is indistinguishable from a permanent capacity problem, so retrying it is a policy change, not a bug fix. |
+| `hintlessBaseDelayMs` | The first hint-less backoff step. |
+
+## Observability
+
+Every wait and give-up goes through `ctx.logger` under the `cooldown-retry` name, so it shows up with the rest of the app's logs instead of a bare `console.log`:
+
+```
+[cooldown-retry] upstream cooling down for nuaa (turn 3 step 2): retrying in 28000ms (1/5)
+```
+
+In the composer, `/cooldown-retry` prints the counters:
+
+```
+cooldown-retry — budget per turn, max 5 retries, window 1000–300000ms
+this turn: retries 3 | waited 1m 24s | gave up 1 | no-hint capacity failures 2 | nuaa×3 | last: nuaa 28.0s (5/5) — budget spent
+lifetime:  retries 11 | waited 4m 12s | gave up 2 | no-hint capacity failures 7 | nuaa×9 deepseek×2
+```
+
+The command is registered only when the `commands` service is present. A context without it — headless, ACP, a partial profile — still mounts and still retries; only the command is missing. That is deliberate: making `commands` a hard `inject` dependency would park the whole plugin in `waiting` over a cosmetic command.
 
 ## Uninstall
 
@@ -125,7 +153,11 @@ So running two copies — say the bundle row plus a dynamic plugin — does **no
 npm test        # node --test — no dependencies, no build step
 ```
 
-The retry-decision helpers — `extractDelayMs`, `isCapacityFailure`, `clampDelay`, `resolveOptions` — are exported and unit-tested; `apply()` is thin Cordis wiring around them, and the suite drives it through a stub context so what it owns, what it delegates, and how it counts are all covered.
+The retry-decision helpers — `extractDelayMs`, `isCapacityFailure`, `clampDelay`, `planDelay`, `counterKey`, `resolveOptions`, `createStats`, `formatStats` — are exported and unit-tested; `apply()` is thin Cordis wiring around them, and the suite drives it through a stub context so what it owns, what it delegates, and how it counts are all covered.
+
+The stub context is a stand-in, not proof: `npm test` runs under `node --test`, which spawns a child process per file, so on a locked-down machine (or under a sandbox that forbids piped stdio) it can fail with `spawn EPERM` even though the suite is green. `node test/retry.test.js` runs the same tests in-process and is the fallback.
+
+`inject` deliberately lists only `timer`. `commands` and `logger` are read through `ctx.get` / `ctx.logger` and degrade gracefully, and `ctx.logger` is used in its **callable** form — `ctx.logger('cooldown-retry')` — with a plain-object fallback, because Cordis's logger service is both callable and carries `.info`/`.warn` directly.
 
 ### Why the hint patterns look like that
 

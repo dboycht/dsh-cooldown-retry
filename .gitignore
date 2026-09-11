@@ -1,6 +1,10 @@
 # dependencies
 node_modules/
 
+# internal continuation notes — development copy only, never published
+DEVELOPMENT.md
+ERROR.md
+
 # logs
 *.log
 

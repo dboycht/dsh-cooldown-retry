@@ -25,13 +25,54 @@ DSH 其实**能**用上这个提示，但只有一条很窄的路径：
 
 |  | 内置 `llm-retry`（无可用提示时） | `dsh-cooldown-retry` |
 |---|---|---|
-| 每个 (turn, step, provider) 尝试次数 | 2 | 5 |
+| 每个 (turn, provider) 尝试次数 | 2 | 5 |
 | 退避策略 | 固定 ~500ms → 1s | 直接采用上游给的 `retry_after_seconds` |
 | 延时区间 | — | 钳制在 1s … 300s |
 | 响应中断 | — | 是——本轮被取消时立刻结束等待 |
-| 识别的提示字段 | — | `providerRetryAfterMs`、`retry_after_seconds`、`retry_after_ms`、散文式 `retry after N` |
+| 识别的提示字段 | — | `providerRetryAfterMs`、`retryAfter`、`retry_after_seconds`、`retry_after_ms`、散文式 `retry after N` |
 
 它**只**接管同时满足两个条件的失败：看起来是容量冷却，**且**带有重试延时提示。其余情况一律通过 `next()` 交给下一个监听者，所以鉴权错误、网络错误、以及不带提示的 429 都保持内置行为不变。
+
+预算是按 **turn + provider** 计的，而不是按 step：一个多步的 turn 里每一步都撞同一个冷却时，它们共享一份预算，而不是每步各拿一份新的 5 次。进入新 turn 时预算重置。
+
+## 配置
+
+默认值 `maxRetries: 5`、`minDelayMs: 1000`、`maxDelayMs: 300000`、`acrossSteps: true`、`hintlessBackoff: false`、`hintlessBaseDelayMs: 5000`。在你自己的 patch 层里覆盖：
+
+```yaml
+- id: cooldown-retry
+  config:
+    maxRetries: 10
+    maxDelayMs: 600000
+```
+
+非 `insert` 的 patch 会替换目标行的**整个** `config`，所以没改的键也要重述。不可用的值会被忽略并退回默认值，区间写反了会被修正而不是照单全收；`maxRetries` 上限为 100。
+
+| 键 | 含义 |
+|---|---|
+| `maxRetries` | 每个 turn/provider 耐心重试多少次后把失败交还给下游。 |
+| `minDelayMs` / `maxDelayMs` | 所有等待都会被钳进这个区间。 |
+| `acrossSteps` | `true`（默认）让一个 turn 的各 step 共享一份预算；`false` 恢复「每个 turn/step 各一份」。 |
+| `hintlessBackoff` | 连**没有**提示的容量冷却也接管，退避用 `hintlessBaseDelayMs * 2^(attempt-1)`。默认关闭：无提示的限流与「容量永久不足」在观感上无法区分，接管它是策略变更而不是修 bug。 |
+| `hintlessBaseDelayMs` | 无提示退避的第一步延时。 |
+
+## 可观测性
+
+每次等待与放弃都走 `ctx.logger`、名为 `cooldown-retry`，与其它应用日志并列，而不是裸 `console.log`：
+
+```
+[cooldown-retry] upstream cooling down for nuaa (turn 3 step 2): retrying in 28000ms (1/5)
+```
+
+在输入框里执行 `/cooldown-retry` 会打印计数器：
+
+```
+cooldown-retry — budget per turn, max 5 retries, window 1000–300000ms
+this turn: retries 3 | waited 1.4s | gave up 1 | no-hint capacity failures 2 | nuaa×3 | last: nuaa 28.0s (5/5) — budget spent
+lifetime:  retries 11 | waited 4m 12s | gave up 2 | no-hint capacity failures 7 | nuaa×9 deepseek×2
+```
+
+该命令只在 `commands` 服务存在时注册。没有它的上下文——headless、ACP、不完整的 profile——照样挂载、照样重试，只是没有这条命令。这是刻意的：把 `commands` 写成硬 `inject` 依赖，会因为一条装饰性命令而让整个插件卡在 `waiting`。
 
 ## 安装
 
@@ -56,19 +97,6 @@ dsh plugin --profile web add github:dboycht/dsh-cooldown-retry
 ```
 
 写进机器级 `$DSH_HOME/cordis.patch.yml`（所有 profile 生效）或某个 profile 自己的 `cordis.patch.yml`（仅该 profile）。两层都被监视，保存即热生效。
-
-## 配置
-
-默认值 `maxRetries: 5`、`minDelayMs: 1000`、`maxDelayMs: 300000`。在你自己的 patch 层里覆盖：
-
-```yaml
-- id: cooldown-retry
-  config:
-    maxRetries: 10
-    maxDelayMs: 600000
-```
-
-非 `insert` 的 patch 会替换目标行的**整个** `config`，所以没改的键也要重述。不可用的值会被忽略并退回默认值，区间写反了会被修正而不是照单全收。
 
 ## 卸载
 
@@ -125,7 +153,11 @@ dsh plugin --profile web remove dsh-cooldown-retry
 npm test        # node --test —— 零依赖、无需构建
 ```
 
-重试决策相关的纯函数——`extractDelayMs`、`isCapacityFailure`、`clampDelay`、`resolveOptions`——都已导出并有单元测试；`apply()` 只是包在它们外面的薄薄一层 Cordis 接线，测试用桩上下文驱动它，因此「接管什么、委托什么、怎么计数」都在覆盖范围内。
+重试决策相关的纯函数——`extractDelayMs`、`isCapacityFailure`、`clampDelay`、`planDelay`、`counterKey`、`resolveOptions`、`createStats`、`formatStats`——都已导出并有单元测试；`apply()` 只是包在它们外面的薄薄一层 Cordis 接线，测试用桩上下文驱动它，因此「接管什么、委托什么、怎么计数」都在覆盖范围内。
+
+桩上下文只是替身，不算证明：`npm test` 走 `node --test`，它为每个测试文件 **spawn 一个子进程**，因此在受限机器（或禁止管道 stdio 的沙箱）里即使用例全绿也可能报 `spawn EPERM`。`node test/retry.test.js` 是同一套用例的进程内跑法，作为兜底。
+
+`inject` 里刻意只有 `timer`：`commands` 与 `logger` 都通过 `ctx.get` / `ctx.logger` 读取并优雅降级；`ctx.logger` 用的是**可调用形式**——`ctx.logger('cooldown-retry')`——并保留普通对象兜底，因为 Cordis 的 logger 服务既可调用、又直接挂着 `.info`/`.warn`。
 
 ### 为什么提示正则长这样
 

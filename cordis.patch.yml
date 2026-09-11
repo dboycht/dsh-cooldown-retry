@@ -8,6 +8,7 @@
 #
 # No `config` here on purpose: the plugin's built-in defaults are
 #   maxRetries 5 / minDelayMs 1000 / maxDelayMs 300000
+#   acrossSteps true / hintlessBackoff false / hintlessBaseDelayMs 5000
 # To change them, target this row's id from your own profile or home
 # cordis.patch.yml (a non-insert patch replaces the row's whole config, so
 # restate every key you want to keep):
@@ -15,6 +16,11 @@
 #   - id: cooldown-retry
 #     config:
 #       maxRetries: 10
+#
+# Observability: waits and give-ups are logged through `ctx.logger` under the
+# `cooldown-retry` name, and `/cooldown-retry` prints the counters. The command
+# is registered only when the `commands` service is present, so a profile
+# without it still mounts and still retries.
 - insert:
     - id: cooldown-retry
       name: dsh-cooldown-retry
