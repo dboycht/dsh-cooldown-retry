@@ -82,9 +82,21 @@ lifetime:  retries 11 | waited 4m 12s | gave up 2 | no-hint capacity failures 7 
 dsh plugin --profile web add github:dboycht/dsh-cooldown-retry
 ```
 
-`dsh plugin add` 会把包装进 profile、登记 `dsh.bundle.patch` 声明的组合包层，该行在下一次配置重载时挂载——**无需重启**。设计上就是永久的，升级也不会丢。
+`dsh plugin add` 会把包装进 profile、登记 `dsh.bundle.patch` 声明的组合包层，该行在下一次配置重载时挂载——**无需重启**。设计上就是永久的，升级也不会丢。（它底层是把参数转发给 profile 目录里的 pnpm，所以 `github:` 写法需要 `PATH` 上有 `git`——DSH 本身本来也依赖这一点。）
 
-**验证**是否挂上：插件清单里应出现 `cooldown-retry` 且 `phase=active`。`active` 表示模块导入成功且 `inject: ['timer']` 已满足；若是 *waiting*，说明这行没挂上。
+**验证**是否挂上——让 DSH 打印组合后的配置树，看有没有这一行：
+
+```sh
+dsh --profile web --dump-config | grep -A2 'cooldown-retry'
+```
+
+```yaml
+# == dsh-cooldown-retry
+- id: cooldown-retry
+  name: dsh-cooldown-retry
+```
+
+**位置很重要**：这一行必须出现在内置 `llm-retry` 行的**后面**。`agent/request-error` 是 waterfall，后注册的监听者绑定为内层监听者，因此本插件才能对每次失败拥有优先接管权，而不是被内置快速重试短路。
 
 ### 不安装包，直接挂文件
 
@@ -150,8 +162,11 @@ dsh plugin --profile web remove dsh-cooldown-retry
 ## 开发
 
 ```sh
+git clone https://github.com/dboycht/dsh-cooldown-retry && cd dsh-cooldown-retry
 npm test        # node --test —— 零依赖、无需构建
 ```
+
+测试在 `test/` 目录，它**不属于**发布/安装包（`files` 白名单只装运行 DSH 所需的文件），所以请克隆仓库后再跑，不要在 `node_modules` 里跑。
 
 重试决策相关的纯函数——`extractDelayMs`、`isCapacityFailure`、`clampDelay`、`planDelay`、`counterKey`、`resolveOptions`、`createStats`、`formatStats`——都已导出并有单元测试；`apply()` 只是包在它们外面的薄薄一层 Cordis 接线，测试用桩上下文驱动它，因此「接管什么、委托什么、怎么计数」都在覆盖范围内。
 

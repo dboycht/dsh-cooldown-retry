@@ -1,6 +1,6 @@
 {
   "name": "dsh-cooldown-retry",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Patient auto-retry for DeepSeek Harness: honor the upstream gateway's retry_after_seconds on a 429 capacity cooldown instead of giving up after two fast retries. Optional floating countdown badge included.",
   "type": "module",
   "main": "index.js",

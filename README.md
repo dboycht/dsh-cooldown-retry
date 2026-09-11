@@ -43,9 +43,21 @@ The budget is counted **per turn and provider**, not per step: a multi-step turn
 dsh plugin --profile web add github:dboycht/dsh-cooldown-retry
 ```
 
-`dsh plugin add` installs the package into the profile, registers the bundle layer declared by `dsh.bundle.patch`, and the row mounts on the next config reload — **no restart needed**. It is permanent by design and survives upgrades.
+`dsh plugin add` installs the package into the profile, registers the bundle layer declared by `dsh.bundle.patch`, and the row mounts on the next config reload — **no restart needed**. It is permanent by design and survives upgrades. (Under the hood it forwards to pnpm in the profile directory, so it needs `git` on `PATH` for a `github:` specifier — the same requirement DSH itself already has.)
 
-**Verify** it mounted: the plugin inventory should list `cooldown-retry` with `phase=active`. `active` means the module imported and `inject: ['timer']` resolved; a *waiting* row did not mount.
+**Verify** it mounted — ask DSH for the composed tree and look for the row:
+
+```sh
+dsh --profile web --dump-config | grep -A2 'cooldown-retry'
+```
+
+```yaml
+# == dsh-cooldown-retry
+- id: cooldown-retry
+  name: dsh-cooldown-retry
+```
+
+Its position matters: the row must appear *after* the built-in `llm-retry` row. `agent/request-error` is a waterfall and later-registered listeners bind as inner listeners, so this plugin gets first refusal on each failure instead of being short-circuited by the built-in fast retry.
 
 ### Without installing a package
 
@@ -150,8 +162,11 @@ So running two copies — say the bundle row plus a dynamic plugin — does **no
 ## Development
 
 ```sh
-npm test        # node --test — no dependencies, no build step
+git clone https://github.com/dboycht/dsh-cooldown-retry && cd dsh-cooldown-retry
+npm test        # node --test — no dependencies, no build step needed
 ```
+
+The suite lives in `test/`, which is **not** part of the published/installed package (the `files` whitelist ships only what a running DSH needs), so clone the repository rather than running this inside `node_modules`.
 
 The retry-decision helpers — `extractDelayMs`, `isCapacityFailure`, `clampDelay`, `planDelay`, `counterKey`, `resolveOptions`, `createStats`, `formatStats` — are exported and unit-tested; `apply()` is thin Cordis wiring around them, and the suite drives it through a stub context so what it owns, what it delegates, and how it counts are all covered.
 
