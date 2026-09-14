@@ -10,13 +10,28 @@ import {
   extractDelayMs,
   formatStats,
   isCapacityFailure,
+  isMislabeledModalityClientError,
+  isRecentSaturation,
   planDelay,
+  planMislabeledDelay,
   resolveOptions,
 } from '../index.js'
 
 /** The exact shape of the 429 a shared gateway returns during pool exhaustion. */
 const COOLING_MESSAGE =
   'All upstream providers are cooling down. Please retry after 28 seconds.'
+
+/**
+ * The two gateway bodies observed in real session logs. Neither carries a hint
+ * the client can act on, and the request behind them was plain text — no audio
+ * anywhere. `MISLABELED_BODY` is the confusing one: it has no capacity keyword
+ * at all, so it used to fall straight through to the built-in retry and fail
+ * the turn even though the gateway was mid-storm.
+ */
+const MISLABELED_BODY =
+  '400: {"type":"invalid_request_error","code":"400001","message":"Audio modality is not supported","source":"client","request_id":"a76477e5-aaa5-4d92-93c4-cfd34b74638d"}'
+const CIRCUIT_BODY =
+  '400: {"message":"HTTP 400: Audio modality is not supported","type":"upstream_client_error_circuit_open","code":"circuit.client_error","retry_after_sec":5}'
 
 // ---------------------------------------------------------------------------
 // Hint extraction.
@@ -96,6 +111,59 @@ test('a capacity cooldown with no hint is reported but not retried', () => {
 })
 
 // ---------------------------------------------------------------------------
+// The mislabeled client error: a saturation-era gateway answering an ordinary
+// request with a modality 400, caching it in a client-error circuit, and then
+// replaying it. The classifier must be narrow enough that a genuine rejection
+// still reaches the caller untouched.
+// ---------------------------------------------------------------------------
+
+test('isMislabeledModalityClientError recognizes the gateway bodies verbatim', () => {
+  const plain = { message: MISLABELED_BODY, code: 'INVALID_REQUEST' }
+  assert.equal(isMislabeledModalityClientError(plain), true)
+  assert.equal(isMislabeledModalityClientError({ message: CIRCUIT_BODY }), true)
+  // The circuit form is also a capacity failure, which is why it never needed
+  // this path — but the classifier must not disagree about its shape.
+  assert.equal(isCapacityFailure({ message: CIRCUIT_BODY }), true)
+})
+
+test('isMislabeledModalityClientError leaves everything else alone', () => {
+  assert.equal(isMislabeledModalityClientError({ message: 'invalid api key' }), false)
+  assert.equal(
+    isMislabeledModalityClientError({ message: 'Audio modality is not supported' }),
+    false,
+    'a bare modality line with no 400 / invalid-request envelope is not this bug',
+  )
+  assert.equal(
+    isMislabeledModalityClientError({
+      message: '400: {"type":"invalid_request_error","message":"Failed to deserialize the JSON body into the target type: messages[0].role: unknown variant `developer`"}',
+    }),
+    false,
+    'a real schema rejection is not a modality complaint',
+  )
+  assert.equal(isMislabeledModalityClientError({ code: 'CONTEXT_WINDOW_EXCEEDED' }), false)
+  assert.equal(isMislabeledModalityClientError({ code: 'INVALID_REQUEST' }), false)
+  assert.equal(isMislabeledModalityClientError(undefined), false)
+  assert.equal(isMislabeledModalityClientError(null), false)
+})
+
+test('planMislabeledDelay prefers a hint and otherwise backs off from its own base', () => {
+  assert.deepEqual(planMislabeledDelay(1, 4000), { delayMs: 4000, source: 'hint' })
+  assert.deepEqual(planMislabeledDelay(1, undefined), { delayMs: 15000, source: 'mislabeled-backoff' })
+  assert.deepEqual(planMislabeledDelay(2, undefined), { delayMs: 30000, source: 'mislabeled-backoff' })
+  assert.deepEqual(planMislabeledDelay(3, undefined), { delayMs: 60000, source: 'mislabeled-backoff' })
+  assert.deepEqual(planMislabeledDelay(20, undefined), { delayMs: 300000, source: 'mislabeled-backoff' })
+  const narrow = resolveOptions({ mislabeledBaseDelayMs: 500, minDelayMs: 100, maxDelayMs: 2000 })
+  assert.deepEqual(planMislabeledDelay(4, undefined, narrow), { delayMs: 2000, source: 'mislabeled-backoff' })
+})
+
+test('isRecentSaturation only trusts a cooldown inside the evidence window', () => {
+  assert.equal(isRecentSaturation(1000, 1500, 600), true)
+  assert.equal(isRecentSaturation(1000, 1600, 600), true)
+  assert.equal(isRecentSaturation(1000, 1601, 600), false)
+  assert.equal(isRecentSaturation(undefined, 1500, 600), false)
+})
+
+// ---------------------------------------------------------------------------
 // Delay planning and clamping.
 // ---------------------------------------------------------------------------
 
@@ -159,6 +227,25 @@ test('resolveOptions carries the new counting and backoff options', () => {
   assert.equal(options.acrossSteps, false)
   assert.equal(options.hintlessBackoff, true)
   assert.equal(options.hintlessBaseDelayMs, 750)
+})
+
+test('resolveOptions carries the mislabeled-400 options', () => {
+  const options = resolveOptions({
+    mislabeledClientError: false,
+    mislabeledMaxRetries: 7,
+    mislabeledBaseDelayMs: 2500,
+    mislabeledEvidenceMs: 30000,
+  })
+  assert.equal(options.mislabeledClientError, false)
+  assert.equal(options.mislabeledMaxRetries, 7)
+  assert.equal(options.mislabeledBaseDelayMs, 2500)
+  assert.equal(options.mislabeledEvidenceMs, 30000)
+  assert.equal(resolveOptions({ mislabeledMaxRetries: 1e9 }).mislabeledMaxRetries, 100)
+  assert.equal(
+    resolveOptions({ mislabeledClientError: 'yes' }).mislabeledClientError,
+    DEFAULT_OPTIONS.mislabeledClientError,
+    'a junk flag falls back to the default',
+  )
 })
 
 test('resolveOptions caps an absurd maxRetries', () => {
@@ -263,6 +350,16 @@ test('formatStats marks a hint-less backoff run', () => {
   const stats = createStats()
   const text = formatStats(stats, resolveOptions({ hintlessBackoff: true }))
   assert.match(text, /hint-less backoff on/)
+})
+
+test('formatStats advertises the mislabeled-400 takeover', () => {
+  const stats = createStats()
+  assert.match(formatStats(stats, DEFAULT_OPTIONS), /mislabeled-400 takeover on \(max 3\)/)
+  assert.match(formatStats(stats, DEFAULT_OPTIONS), /mislabeled 400 retries 0/)
+  assert.doesNotMatch(
+    formatStats(stats, resolveOptions({ mislabeledClientError: false })),
+    /mislabeled-400 takeover/,
+  )
 })
 
 test('formatStats renders both buckets without leaking live objects', () => {
@@ -602,4 +699,129 @@ test('apply() disposes the listener, the command and the counters together', asy
   assert.equal(typeof ctx.disposer, 'function')
   ctx.disposer()
   assert.deepEqual(ctx.registered, [], 'the command disposer ran')
+})
+
+// ---------------------------------------------------------------------------
+// apply() + the mislabeled client error. The gate is the point: the same 400 is
+// retried only when the provider cooldown that caused the circuit is recent.
+// ---------------------------------------------------------------------------
+
+const MISLABELED_FAILURE = { message: MISLABELED_BODY, code: 'INVALID_REQUEST' }
+
+test('apply() delegates a modality 400 that has no recent cooldown behind it', async () => {
+  const logs = []
+  const logger = { info: (m) => logs.push(m), warn: () => {} }
+  const ctx = fakeContext({ logger })
+  apply(ctx, undefined)
+
+  assert.deepEqual(await ctx.fail(payload({ failure: MISLABELED_FAILURE })), NEXT)
+  assert.equal(ctx.timers.length, 0, 'a real client error must not arm a timer')
+  assert.match(logs[0], /no recent capacity cooldown/)
+})
+
+test('apply() waits out a circuit replay that follows a cooldown', async () => {
+  const ctx = fakeContext()
+  apply(ctx, undefined)
+
+  const cooldown = ctx.fail(payload())
+  assert.equal(ctx.timers.at(-1).ms, 28000)
+  ctx.timers.at(-1).resolve()
+  assert.deepEqual(await cooldown, { kind: 'retry' })
+
+  const replay = ctx.fail(payload({ step: 2, failure: MISLABELED_FAILURE }))
+  assert.equal(ctx.timers.at(-1).ms, DEFAULT_OPTIONS.mislabeledBaseDelayMs)
+  ctx.timers.at(-1).resolve()
+  assert.deepEqual(await replay, { kind: 'retry' })
+})
+
+test('apply() gives circuit replays a budget of their own', async () => {
+  // The 429 budget is deliberately spent first: waiting out the circuit is a
+  // separate policy, so one must not starve the other.
+  const ctx = fakeContext()
+  apply(ctx, { maxRetries: 1, mislabeledMaxRetries: 2 })
+
+  const cooldown = ctx.fail(payload())
+  ctx.timers.at(-1).resolve()
+  assert.deepEqual(await cooldown, { kind: 'retry' })
+  assert.deepEqual(await ctx.fail(payload()), NEXT, 'the 429 budget is spent')
+
+  const first = ctx.fail(payload({ failure: MISLABELED_FAILURE }))
+  assert.equal(ctx.timers.at(-1).ms, 15000, 'attempt 1 uses the base delay')
+  ctx.timers.at(-1).resolve()
+  assert.deepEqual(await first, { kind: 'retry' })
+
+  const second = ctx.fail(payload({ failure: MISLABELED_FAILURE }))
+  assert.equal(ctx.timers.at(-1).ms, 30000, 'attempt 2 doubles it')
+  ctx.timers.at(-1).resolve()
+  assert.deepEqual(await second, { kind: 'retry' })
+
+  assert.deepEqual(
+    await ctx.fail(payload({ failure: MISLABELED_FAILURE })),
+    NEXT,
+    'the replay budget is bounded too',
+  )
+})
+
+test('apply() still takes over a replay in a later turn of the same episode', async () => {
+  // The client-error circuit outlives the turn that opened it, so evidence is
+  // tracked per provider rather than per turn.
+  const ctx = fakeContext()
+  apply(ctx, undefined)
+
+  const cooldown = ctx.fail(payload({ turn: 1 }))
+  ctx.timers.at(-1).resolve()
+  await cooldown
+
+  const replay = ctx.fail(payload({ turn: 2, failure: MISLABELED_FAILURE }))
+  assert.equal(ctx.timers.at(-1).ms, DEFAULT_OPTIONS.mislabeledBaseDelayMs)
+  ctx.timers.at(-1).resolve()
+  assert.deepEqual(await replay, { kind: 'retry' })
+})
+
+test('apply() forgets the evidence once the window has passed', async () => {
+  const ctx = fakeContext()
+  apply(ctx, { mislabeledEvidenceMs: 1 })
+
+  const cooldown = ctx.fail(payload())
+  ctx.timers.at(-1).resolve()
+  await cooldown
+
+  await new Promise((resolve) => setTimeout(resolve, 25))
+  assert.deepEqual(await ctx.fail(payload({ failure: MISLABELED_FAILURE })), NEXT)
+})
+
+test('apply() leaves modality 400s alone when the takeover is off', async () => {
+  const ctx = fakeContext()
+  apply(ctx, { mislabeledClientError: false })
+
+  const cooldown = ctx.fail(payload())
+  ctx.timers.at(-1).resolve()
+  await cooldown
+
+  assert.deepEqual(await ctx.fail(payload({ failure: MISLABELED_FAILURE })), NEXT)
+  assert.equal(ctx.timers.length, 1, 'no second timer was armed')
+})
+
+test('apply() logs and reports circuit-replay retries distinctly', async () => {
+  const logs = []
+  const logger = { info: (m) => logs.push(m), warn: () => {} }
+  const ctx = fakeContext({ withCommands: true, logger })
+  apply(ctx, undefined)
+
+  const cooldown = ctx.fail(payload())
+  ctx.timers.at(-1).resolve()
+  await cooldown
+  logs.length = 0
+
+  const replay = ctx.fail(payload({ failure: MISLABELED_FAILURE }))
+  ctx.timers.at(-1).resolve()
+  await replay
+
+  assert.equal(logs.length, 1)
+  assert.match(logs[0], /modality is not supported/)
+  assert.match(logs[0], /circuit replay/)
+
+  const text = ctx.registered[0].handler({}).text
+  assert.match(text, /mislabeled 400 retries 1/)
+  assert.match(text, /last: nuaa 15\.0s \(1\/3\) — mislabeled 400/)
 })

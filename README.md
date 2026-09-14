@@ -8,6 +8,8 @@
 
 **Patient auto-retry for DeepSeek Harness.** When an upstream model gateway answers with `429 Too Many Requests` plus a `retry_after_seconds` hint — *"All upstream providers are cooling down. Please retry after 28 seconds."* — this plugin waits the delay the upstream actually asked for and retries, instead of letting the built-in `llm-retry` burn two fast attempts (500 ms → ~1 s) inside a 28-second cooldown window and then fail the turn.
 
+It also absorbs one specific gateway bug seen in the field: during saturation a shared gateway can answer an ordinary request with a `400` whose message says *"Audio modality is not supported"* — although the request contained no audio at all — cache that body in a **client-error circuit**, and then replay the same 400 for every later request in the window, failing turn after turn. Once that provider has shown a capacity cooldown moments earlier, this plugin treats such a body as circuit replay and waits it out, on its own separate budget.
+
 ## The problem
 
 Shared LLM gateways (campus networks, self-hosted proxies, provider pools) frequently answer with a **capacity** 429 rather than a connectivity error: the pool is momentarily exhausted or its circuit breaker is open, and the response tells you exactly how long to wait.
@@ -31,7 +33,7 @@ Reading the hint out of the message and then waiting as long as the upstream ask
 | Abort-aware | — | yes — a cancelled turn ends the wait immediately |
 | Hints parsed | — | `providerRetryAfterMs`, `retryAfter`, `retry_after_seconds`, `retry_after_ms`, prose `retry after N` |
 
-It takes over **only** failures that both look like a capacity cooldown *and* carry a retry hint. Everything else is handed to the next listener with `next()`, so auth errors, network errors, and hint-less 429s keep their built-in behavior.
+It takes over **only** two shapes of failure: a capacity cooldown that carries a retry hint, and — with `mislabeledClientError` (on by default) — a `400` that claims a modality "is not supported" **and** arrives within `mislabeledEvidenceMs` of a capacity cooldown on the same provider. Everything else is handed to the next listener with `next()`, so auth errors, network errors, hint-less 429s, and genuine client errors keep their built-in behavior.
 
 The budget is counted **per turn and provider**, not per step: a multi-step turn that trips the same cooldown in every step shares one budget instead of getting a fresh five in each. A new turn resets it.
 
@@ -73,7 +75,7 @@ Put that in your home-level `$DSH_HOME/cordis.patch.yml` (every profile) or a pr
 
 ## Configure
 
-Defaults are `maxRetries: 5`, `minDelayMs: 1000`, `maxDelayMs: 300000`, `acrossSteps: true`, `hintlessBackoff: false`, `hintlessBaseDelayMs: 5000`. Override them from your own patch layer:
+Defaults are `maxRetries: 5`, `minDelayMs: 1000`, `maxDelayMs: 300000`, `acrossSteps: true`, `hintlessBackoff: false`, `hintlessBaseDelayMs: 5000`, `mislabeledClientError: true`, `mislabeledMaxRetries: 3`, `mislabeledBaseDelayMs: 15000`, `mislabeledEvidenceMs: 600000`. Override them from your own patch layer:
 
 ```yaml
 - id: cooldown-retry
@@ -82,7 +84,7 @@ Defaults are `maxRetries: 5`, `minDelayMs: 1000`, `maxDelayMs: 300000`, `acrossS
     maxDelayMs: 600000
 ```
 
-A non-`insert` patch replaces the targeted row's **whole** `config`, so restate every key you want to keep. Unusable values are ignored in favour of the defaults, and an inverted window is repaired rather than accepted. `maxRetries` is capped at 100.
+A non-`insert` patch replaces the targeted row's **whole** `config`, so restate every key you want to keep. Unusable values are ignored in favour of the defaults, and an inverted window is repaired rather than accepted. `maxRetries` and `mislabeledMaxRetries` are capped at 100.
 
 | Key | Meaning |
 |---|---|
@@ -91,6 +93,10 @@ A non-`insert` patch replaces the targeted row's **whole** `config`, so restate 
 | `acrossSteps` | `true` (default) shares one budget across the steps of a turn; `false` restores a budget per turn/step. |
 | `hintlessBackoff` | Also take over a capacity cooldown that carries **no** hint, using `hintlessBaseDelayMs * 2^(attempt-1)`. Off by default: hint-less throttling is indistinguishable from a permanent capacity problem, so retrying it is a policy change, not a bug fix. |
 | `hintlessBaseDelayMs` | The first hint-less backoff step. |
+| `mislabeledClientError` | `true` (default) also waits out a `400` that claims a modality "is not supported" while the request carried no such thing — the client-error circuit a saturated gateway creates and then replays. Set `false` to let every `400` reach the caller untouched. |
+| `mislabeledMaxRetries` | Retry budget for those replays, **separate** from `maxRetries`: waiting out a circuit must not compete with the 429 budget. |
+| `mislabeledBaseDelayMs` | Base delay for a replay that carries no hint of its own (`retry_after_sec` in a circuit body is used verbatim when present). Doubles per attempt. |
+| `mislabeledEvidenceMs` | How long a capacity cooldown keeps counting as evidence. Outside this window the same `400` is treated as a genuine client error and delegated. |
 
 ## Observability
 
@@ -103,9 +109,9 @@ Every wait and give-up goes through `ctx.logger` under the `cooldown-retry` name
 In the composer, `/cooldown-retry` prints the counters:
 
 ```
-cooldown-retry — budget per turn, max 5 retries, window 1000–300000ms
-this turn: retries 3 | waited 1m 24s | gave up 1 | no-hint capacity failures 2 | nuaa×3 | last: nuaa 28.0s (5/5) — budget spent
-lifetime:  retries 11 | waited 4m 12s | gave up 2 | no-hint capacity failures 7 | nuaa×9 deepseek×2
+cooldown-retry — budget per turn, max 5 retries, window 1000–300000ms, mislabeled-400 takeover on (max 3)
+this turn: retries 3 | waited 84s | gave up 1 | no-hint capacity failures 2 | mislabeled 400 retries 1 | nuaa×4 | last: nuaa 15.0s (1/3) — mislabeled 400
+lifetime:  retries 11 | waited 4m 12s | gave up 2 | no-hint capacity failures 7 | mislabeled 400 retries 3 | nuaa×10 deepseek×2
 ```
 
 The command is registered only when the `commands` service is present. A context without it — headless, ACP, a partial profile — still mounts and still retries; only the command is missing. That is deliberate: making `commands` a hard `inject` dependency would park the whole plugin in `waiting` over a cosmetic command.

@@ -13,6 +13,14 @@
  * returns `{ kind: 'retry' }` to own the recovery. Anything else is delegated to
  * the next listener — and ultimately to the built-in `llm-retry` — by `next()`.
  *
+ * It also owns one deliberately narrow second case: a saturation-era gateway can
+ * answer a perfectly ordinary request with an `invalid_request_error` 400 whose
+ * message reads "modality is not supported", open a client-error circuit on it,
+ * and then replay that same cached 400 for every later request in the window —
+ * so a plain "继续" turn fails with an error the client cannot possibly fix.
+ * That shape is retried only when the same provider showed a capacity cooldown
+ * moments earlier (`mislabeledClientError`, on by default).
+ *
  * Observability is deliberately dependency-free: counters live in memory, are
  * logged through `ctx.logger`, and are queryable from the composer with
  * `/cooldown-retry`. The command registration is opportunistic — a context
@@ -46,6 +54,21 @@ export const DEFAULT_OPTIONS = Object.freeze({
    */
   hintlessBackoff: false,
   hintlessBaseDelayMs: 5000,
+  /**
+   * Take over the gateway's mislabeled client error: a 400 whose message is
+   * "... modality is not supported" returned by a shared gateway that is cooling
+   * down, cached in a client-error circuit, and then replayed for every later
+   * request in the window. Guarded by `mislabeledEvidenceMs` — without a recent
+   * capacity cooldown for the same provider it is a genuine client error and is
+   * delegated untouched.
+   */
+  mislabeledClientError: true,
+  /** Its own retry budget, separate from the 429 budget (`maxRetries`). */
+  mislabeledMaxRetries: 3,
+  /** Base delay for a replay with no hint of its own; doubles per attempt. */
+  mislabeledBaseDelayMs: 15000,
+  /** How long a capacity cooldown keeps counting as evidence for the above. */
+  mislabeledEvidenceMs: 600000,
 })
 
 /** The `maxRetries` window used when a row sets an unusable value. */
@@ -72,6 +95,16 @@ export function resolveOptions(config) {
   options.hintlessBackoff = flag(source.hintlessBackoff, DEFAULT_OPTIONS.hintlessBackoff)
   if (positiveNumber(source.hintlessBaseDelayMs)) {
     options.hintlessBaseDelayMs = Math.floor(source.hintlessBaseDelayMs)
+  }
+  options.mislabeledClientError = flag(source.mislabeledClientError, DEFAULT_OPTIONS.mislabeledClientError)
+  if (positiveNumber(source.mislabeledMaxRetries)) {
+    options.mislabeledMaxRetries = Math.min(Math.floor(source.mislabeledMaxRetries), MAX_RETRY_CEILING)
+  }
+  if (positiveNumber(source.mislabeledBaseDelayMs)) {
+    options.mislabeledBaseDelayMs = Math.floor(source.mislabeledBaseDelayMs)
+  }
+  if (positiveNumber(source.mislabeledEvidenceMs)) {
+    options.mislabeledEvidenceMs = Math.floor(source.mislabeledEvidenceMs)
   }
   // An inverted window would make clamp() return maxDelayMs forever; keep it sane.
   if (options.maxDelayMs < options.minDelayMs) options.maxDelayMs = options.minDelayMs
@@ -110,6 +143,29 @@ const CAPACITY_PATTERN = new RegExp([
   'rate[\\s_-]*limit(?:ed|_exceeded|s)?\\b',
   'server[\\s_-]*(?:is[\\s_-]*)?busy',
 ].join('|'), 'i')
+
+/**
+ * Is this the gateway's *mislabeled* client error — a 400 that says some
+ * modality "is not supported" even though the request carried nothing of the
+ * kind (verified: plain text, occasionally images, never audio)?
+ *
+ * This is the signature of a shared gateway that, after an upstream saturation
+ * episode, answers with an `invalid_request_error` 400 (code 400001,
+ * `source: "client"`), opens a client-error circuit on it, and replays the same
+ * cached body for every later request until the circuit closes. It is
+ * deliberately narrow: it must mention a modality, say it is not supported, AND
+ * carry the 400 / invalid-request signal. A bare "modality is not supported"
+ * without that envelope is not treated as this bug.
+ */
+export function isMislabeledModalityClientError(failure) {
+  if (failure === undefined || failure === null) return false
+  const message = typeof failure.message === 'string' ? failure.message : ''
+  const code = typeof failure.code === 'string' ? failure.code : ''
+  const text = message + ' ' + code
+  if (!/modalit/i.test(text)) return false
+  if (!/not[\s_-]*supported/i.test(text)) return false
+  return /\b400\b/.test(message) || /invalid[_\s-]*request/i.test(text)
+}
 
 // Hint patterns, tried in this order. Every separator is [_\s-]* so that the
 // snake_case key form (`retry_after_ms`), the header form (`Retry-After`), and
@@ -209,6 +265,28 @@ export function planDelay(attempt, hintMs, options = DEFAULT_OPTIONS) {
   return { delayMs: clampDelay(raw, options), source: 'backoff' }
 }
 
+/**
+ * The delay for one attempt at a mislabeled modality 400 (gateway circuit
+ * replay). Its own hint — e.g. the `retry_after_sec` a circuit-open body can
+ * carry — wins; otherwise the delay grows exponentially from
+ * `mislabeledBaseDelayMs`. Kept separate from `planDelay` so the two policies
+ * can be tuned and reported independently.
+ */
+export function planMislabeledDelay(attempt, hintMs, options = DEFAULT_OPTIONS) {
+  if (hintMs !== undefined) return { delayMs: clampDelay(hintMs, options), source: 'hint' }
+  const raw = options.mislabeledBaseDelayMs * 2 ** Math.max(0, attempt - 1)
+  return { delayMs: clampDelay(raw, options), source: 'mislabeled-backoff' }
+}
+
+/**
+ * Did the given provider show a capacity cooldown recently enough to count as
+ * evidence that a following modality 400 is a circuit replay rather than a
+ * genuine client error? `recordedAt` is the epoch ms of the last cooldown.
+ */
+export function isRecentSaturation(recordedAt, now, windowMs) {
+  return typeof recordedAt === 'number' && now - recordedAt <= windowMs
+}
+
 /** `${turn}:${provider}` when counting across steps, `${turn}:${step}:${provider}` otherwise. */
 export function counterKey(entry, options = DEFAULT_OPTIONS) {
   return options.acrossSteps === true
@@ -225,6 +303,7 @@ export function createStats() {
     waits: 0,
     giveUps: 0,
     skipped: 0,
+    mislabeled: 0,
     totalWaitMs: 0,
     byProvider: {},
     last: undefined,
@@ -236,6 +315,7 @@ export function createStats() {
     bucket.waits += 1
     bucket.totalWaitMs += entry.waitMs
     bucket.byProvider[entry.provider] = (bucket.byProvider[entry.provider] ?? 0) + 1
+    if (entry.mislabeled === true) bucket.mislabeled += 1
     bucket.last = entry
   }
 
@@ -268,6 +348,7 @@ export function createStats() {
       session.waits = 0
       session.giveUps = 0
       session.skipped = 0
+      session.mislabeled = 0
       session.totalWaitMs = 0
       session.byProvider = {}
       session.last = undefined
@@ -306,10 +387,12 @@ function formatBucket(bucket) {
       + ' (' + last.attempt + '/' + last.maxRetries + ')'
       + (last.outcome === 'give-up' ? ' — budget spent' : '')
       + (last.outcome === 'skipped' ? ' — no hint' : '')
+      + (last.mislabeled === true ? ' — mislabeled 400' : '')
   return 'retries ' + bucket.waits
     + ' | waited ' + formatWaits(bucket.totalWaitMs)
     + ' | gave up ' + bucket.giveUps
     + ' | no-hint capacity failures ' + bucket.skipped
+    + ' | mislabeled 400 retries ' + bucket.mislabeled
     + (providers.length > 0 ? ' | ' + providers.join(' ') : '')
     + suffix
 }
@@ -320,7 +403,10 @@ export function formatStats(stats, options = DEFAULT_OPTIONS) {
     'cooldown-retry — ' + (options.acrossSteps === true ? 'budget per turn' : 'budget per turn/step')
       + ', max ' + options.maxRetries + ' retries'
       + ', window ' + options.minDelayMs + '–' + options.maxDelayMs + 'ms'
-      + (options.hintlessBackoff === true ? ', hint-less backoff on' : ''),
+      + (options.hintlessBackoff === true ? ', hint-less backoff on' : '')
+      + (options.mislabeledClientError === true
+        ? ', mislabeled-400 takeover on (max ' + options.mislabeledMaxRetries + ')'
+        : ''),
     'this turn: ' + formatBucket(stats.session),
     'lifetime:  ' + formatBucket(stats.lifetime),
   ].join('\n')
@@ -358,6 +444,8 @@ export function apply(ctx, config) {
   const stats = createStats()
   /** Attempts already spent, per counter key. */
   const counters = new Map()
+  /** Last capacity-cooldown timestamp per provider, for the mislabeled-400 gate. */
+  const saturatedAt = new Map()
   let currentTurn
 
   /**
@@ -386,6 +474,19 @@ export function apply(ctx, config) {
   }
 
   /**
+   * The shared tail of both policies: wait, then claim the retry. An aborted
+   * turn resolves `undefined`, which the waterfall treats as "no action".
+   */
+  function waitAndRetry(payload, wait) {
+    const { signal } = payload
+    return (async () => {
+      const ok = await cancellableDelay(wait, signal)
+      if (!ok) return undefined
+      return { kind: 'retry' }
+    })()
+  }
+
+  /**
    * Start a new turn when the incoming failure belongs to one: every budget from
    * the previous turn is dropped, so the map cannot grow without bound across a
    * long session. Runs before anything is recorded, including the skip path, so
@@ -398,8 +499,7 @@ export function apply(ctx, config) {
     stats.resetSession()
   }
 
-  function attemptFor(entry) {
-    const key = counterKey(entry, options)
+  function attemptFor(entry, key = counterKey(entry, options)) {
     if (counters.size > 256) {
       for (const [staleKey, value] of counters) {
         if (value.turn !== entry.turn) counters.delete(staleKey)
@@ -411,15 +511,37 @@ export function apply(ctx, config) {
   const disposeListener = ctx.on('agent/request-error', (payload, next) => {
     const failure = payload.failure
     if (failure === undefined || failure === null) return next()
-    if (!isCapacityFailure(failure)) return next()
 
-    const hintMs = extractDelayMs(failure)
+    const capacity = isCapacityFailure(failure)
+    const mislabeled = capacity !== true
+      && options.mislabeledClientError === true
+      && isMislabeledModalityClientError(failure)
+    if (capacity !== true && mislabeled !== true) return next()
+
     const owner = {
       turn: payload.turn,
       step: payload.step,
       provider: payload.provider,
     }
     beginTurn(owner.turn)
+    const hintMs = extractDelayMs(failure)
+
+    // The two policies keep separate budgets: burning the 429 budget must not
+    // stop the plugin from waiting out a circuit that replays the bogus 400.
+    return capacity === true
+      ? handleCapacity(payload, next, owner, hintMs)
+      : handleMislabeled(payload, next, owner, hintMs)
+  })
+
+  /**
+   * A capacity cooldown: wait as long as the upstream asked (or back off if
+   * `hintlessBackoff` opted in), within this turn/provider's own budget.
+   */
+  function handleCapacity(payload, next, owner, hintMs) {
+    // Remember that this provider was saturated. A mislabeled modality 400
+    // arriving moments later is the gateway's circuit replaying this episode,
+    // not a real complaint about the request that carries it.
+    saturatedAt.set(owner.provider, Date.now())
 
     if (hintMs === undefined && options.hintlessBackoff !== true) {
       // A capacity cooldown with no usable hint is the noisy case worth
@@ -451,13 +573,59 @@ export function apply(ctx, config) {
       + ' (' + attempt + '/' + maxRetries + ')'
       + (plan.source === 'backoff' ? ' — no hint, exponential fallback' : ''))
 
-    const { signal } = payload
-    return (async () => {
-      const ok = await cancellableDelay(wait, signal)
-      if (!ok) return undefined
-      return { kind: 'retry' }
-    })()
-  })
+    return waitAndRetry(payload, wait)
+  }
+
+  /**
+   * The gateway's mislabeled client error. Only reachable after a recent
+   * capacity cooldown on the same provider: the body says a modality "is not
+   * supported" while the request carried nothing of the kind, which is the
+   * signature of a client-error circuit created during saturation and replayed
+   * for every later request. A modality 400 with no such evidence is a genuine
+   * client error and is delegated untouched.
+   */
+  function handleMislabeled(payload, next, owner, hintMs) {
+    if (!isRecentSaturation(saturatedAt.get(owner.provider), Date.now(), options.mislabeledEvidenceMs)) {
+      log.info('"modality is not supported" 400 for ' + owner.provider
+        + ' (turn ' + owner.turn + ' step ' + owner.step
+        + ') with no recent capacity cooldown — treating it as a real client error')
+      return next()
+    }
+
+    const key = counterKey(owner, options) + ':modality-400'
+    const { count } = attemptFor(owner, key)
+    if (count >= options.mislabeledMaxRetries) {
+      counters.delete(key)
+      stats.giveUp({
+        ...owner,
+        waitMs: 0,
+        attempt: count,
+        maxRetries: options.mislabeledMaxRetries,
+        mislabeled: true,
+      })
+      log.warn('giving up after ' + count + ' mislabeled-400 retries for ' + owner.provider
+        + ' (turn ' + owner.turn + ' step ' + owner.step + ')')
+      return next()
+    }
+    counters.set(key, { count: count + 1, turn: owner.turn })
+
+    const attempt = count + 1
+    const plan = planMislabeledDelay(attempt, hintMs, options)
+    stats.plan({
+      ...owner,
+      waitMs: plan.delayMs,
+      attempt,
+      maxRetries: options.mislabeledMaxRetries,
+      source: plan.source,
+      mislabeled: true,
+    })
+    log.info('"modality is not supported" 400 for ' + owner.provider
+      + ' (turn ' + owner.turn + ' step ' + owner.step + ') after a recent cooldown'
+      + ' — treating it as circuit replay, retrying in ' + plan.delayMs + 'ms'
+      + ' (' + attempt + '/' + options.mislabeledMaxRetries + ')')
+
+    return waitAndRetry(payload, plan.delayMs)
+  }
 
   /**
    * `/cooldown-retry` — the queryable half of the observability story. The

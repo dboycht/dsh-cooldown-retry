@@ -8,6 +8,8 @@
 
 **给 DeepSeek Harness 的「耐心重试」插件。** 上游模型网关返回 `429 Too Many Requests` 并附带 `retry_after_seconds` 时——例如 *「All upstream providers are cooling down. Please retry after 28 seconds.」*——本插件按上游给出的延时等待后重试，而不是让内置 `llm-retry` 在 28 秒冷却窗口里用两次快速重试（500ms → ~1s）必然撞死、直接中断本轮对话。
 
+它还额外吸收一类实测到的网关 bug：饱和期里，共享网关会给一个**完全普通**的请求回 `400`、正文写着 *「Audio modality is not supported」*（而请求里根本没有音频），把这个报文记进**客户端错误熔断器**，然后在熔断窗口内对后续每一个请求**重放同一条 400**，导致一轮接一轮地失败。只要同一 provider 刚刚出现过容量冷却，本插件就把这种报文当作熔断重放，用**独立的预算**把它等过去。
+
 ## 问题所在
 
 共享 LLM 网关（校园网、自建代理、供应商池）高峰期返回的往往不是连通性错误，而是**容量**类 429：池子瞬时耗尽或熔断器打开，并且响应里明确告诉你要等多久。
@@ -31,13 +33,13 @@ DSH 其实**能**用上这个提示，但只有一条很窄的路径：
 | 响应中断 | — | 是——本轮被取消时立刻结束等待 |
 | 识别的提示字段 | — | `providerRetryAfterMs`、`retryAfter`、`retry_after_seconds`、`retry_after_ms`、散文式 `retry after N` |
 
-它**只**接管同时满足两个条件的失败：看起来是容量冷却，**且**带有重试延时提示。其余情况一律通过 `next()` 交给下一个监听者，所以鉴权错误、网络错误、以及不带提示的 429 都保持内置行为不变。
+它**只**接管两类失败：带有重试提示的容量冷却；以及——在 `mislabeledClientError` 打开时（默认开）——一个声称某模态「is not supported」的 `400`，**且**它出现在同一 provider 上一次容量冷却的 `mislabeledEvidenceMs` 窗口之内。其余情况一律通过 `next()` 交给下一个监听者，所以鉴权错误、网络错误、不带提示的 429、以及真正的客户端错误都保持内置行为不变。
 
 预算是按 **turn + provider** 计的，而不是按 step：一个多步的 turn 里每一步都撞同一个冷却时，它们共享一份预算，而不是每步各拿一份新的 5 次。进入新 turn 时预算重置。
 
 ## 配置
 
-默认值 `maxRetries: 5`、`minDelayMs: 1000`、`maxDelayMs: 300000`、`acrossSteps: true`、`hintlessBackoff: false`、`hintlessBaseDelayMs: 5000`。在你自己的 patch 层里覆盖：
+默认值 `maxRetries: 5`、`minDelayMs: 1000`、`maxDelayMs: 300000`、`acrossSteps: true`、`hintlessBackoff: false`、`hintlessBaseDelayMs: 5000`、`mislabeledClientError: true`、`mislabeledMaxRetries: 3`、`mislabeledBaseDelayMs: 15000`、`mislabeledEvidenceMs: 600000`。在你自己的 patch 层里覆盖：
 
 ```yaml
 - id: cooldown-retry
@@ -46,7 +48,7 @@ DSH 其实**能**用上这个提示，但只有一条很窄的路径：
     maxDelayMs: 600000
 ```
 
-非 `insert` 的 patch 会替换目标行的**整个** `config`，所以没改的键也要重述。不可用的值会被忽略并退回默认值，区间写反了会被修正而不是照单全收；`maxRetries` 上限为 100。
+非 `insert` 的 patch 会替换目标行的**整个** `config`，所以没改的键也要重述。不可用的值会被忽略并退回默认值，区间写反了会被修正而不是照单全收；`maxRetries` 与 `mislabeledMaxRetries` 上限均为 100。
 
 | 键 | 含义 |
 |---|---|
@@ -55,6 +57,10 @@ DSH 其实**能**用上这个提示，但只有一条很窄的路径：
 | `acrossSteps` | `true`（默认）让一个 turn 的各 step 共享一份预算；`false` 恢复「每个 turn/step 各一份」。 |
 | `hintlessBackoff` | 连**没有**提示的容量冷却也接管，退避用 `hintlessBaseDelayMs * 2^(attempt-1)`。默认关闭：无提示的限流与「容量永久不足」在观感上无法区分，接管它是策略变更而不是修 bug。 |
 | `hintlessBaseDelayMs` | 无提示退避的第一步延时。 |
+| `mislabeledClientError` | `true`（默认）也把「声称某模态 is not supported、而请求里并没有该模态」的 `400` 等过去——那是饱和网关建立的客户端错误熔断器在重放。设 `false` 则让所有 `400` 原样到达调用方。 |
+| `mislabeledMaxRetries` | 上述重放的独立重试预算，**与 `maxRetries` 分开计**：等熔断不该和 429 预算互相挤占。 |
+| `mislabeledBaseDelayMs` | 重放报文自身没有提示时的基础延时（熔断报文里的 `retry_after_sec` 若存在则原样采用）。按次数翻倍。 |
+| `mislabeledEvidenceMs` | 一次容量冷却在多长时间内仍算「证据」。超出该窗口后，同样的 `400` 会被当作真实客户端错误交还下游。 |
 
 ## 可观测性
 
@@ -67,9 +73,9 @@ DSH 其实**能**用上这个提示，但只有一条很窄的路径：
 在输入框里执行 `/cooldown-retry` 会打印计数器：
 
 ```
-cooldown-retry — budget per turn, max 5 retries, window 1000–300000ms
-this turn: retries 3 | waited 1.4s | gave up 1 | no-hint capacity failures 2 | nuaa×3 | last: nuaa 28.0s (5/5) — budget spent
-lifetime:  retries 11 | waited 4m 12s | gave up 2 | no-hint capacity failures 7 | nuaa×9 deepseek×2
+cooldown-retry — budget per turn, max 5 retries, window 1000–300000ms, mislabeled-400 takeover on (max 3)
+this turn: retries 3 | waited 84s | gave up 1 | no-hint capacity failures 2 | mislabeled 400 retries 1 | nuaa×4 | last: nuaa 15.0s (1/3) — mislabeled 400
+lifetime:  retries 11 | waited 4m 12s | gave up 2 | no-hint capacity failures 7 | mislabeled 400 retries 3 | nuaa×10 deepseek×2
 ```
 
 该命令只在 `commands` 服务存在时注册。没有它的上下文——headless、ACP、不完整的 profile——照样挂载、照样重试，只是没有这条命令。这是刻意的：把 `commands` 写成硬 `inject` 依赖，会因为一条装饰性命令而让整个插件卡在 `waiting`。
