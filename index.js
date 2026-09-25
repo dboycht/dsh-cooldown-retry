@@ -437,11 +437,181 @@ function loggerFor(ctx) {
   }
 }
 
+/** Policy keys for the two durable retry chains this plugin journals. */
+export const CAPACITY_POLICY_KEY = 'cooldown-retry/capacity'
+export const MISLABELED_POLICY_KEY = 'cooldown-retry/mislabeled'
+
+/**
+ * Fallback failure codes. The durable boundary requires a non-empty `code`, and
+ * a capacity failure can reach us with none (an adapter that minted only prose).
+ */
+const CAPACITY_FALLBACK_CODE = 'RATE_LIMIT'
+const MISLABELED_FALLBACK_CODE = 'INVALID_REQUEST'
+
+let retryIdSeq = 0
+
+/**
+ * Mint one retry-chain id. This package stays zero-import, so no `node:crypto`:
+ * a process-local counter plus randomness is unique enough for a chain id that
+ * only has to differ from every other chain in the same session.
+ */
+export function mintRetryId(now = Date.now(), random = Math.random()) {
+  retryIdSeq += 1
+  return 'cooldown-retry-' + now.toString(36) + '-' + retryIdSeq.toString(36)
+    + '-' + random.toString(36).slice(2, 8)
+}
+
+/**
+ * Rebuild a failure payload the durable boundary accepts.
+ *
+ * `llm/retry`'s own invariant requires non-empty `message` and `code`, and
+ * rejects an out-of-range `status`, a non-positive `providerRetryAfterMs`, or a
+ * non-string `requestId`. The raw failure comes from a provider adapter, so the
+ * kept fields are copied one by one rather than spread: an unexpected extra key
+ * is harmless, but a malformed known key would fail the append.
+ */
+export function sanitizeFailure(failure, fallbackCode) {
+  const source = failure !== null && typeof failure === 'object' ? failure : {}
+  const message = typeof source.message === 'string' && source.message.length > 0
+    ? source.message
+    : 'model request failed'
+  const code = typeof source.code === 'string' && source.code.length > 0
+    ? source.code
+    : fallbackCode
+  const clean = { message, code }
+  if (Number.isInteger(source.status) && source.status >= 100 && source.status <= 599) {
+    clean.status = source.status
+  }
+  if (Number.isFinite(source.providerRetryAfterMs) && source.providerRetryAfterMs > 0) {
+    clean.providerRetryAfterMs = source.providerRetryAfterMs
+  }
+  if (typeof source.requestId === 'string' && source.requestId.length > 0) {
+    clean.requestId = source.requestId
+  }
+  return clean
+}
+
+/**
+ * The durable retry journal.
+ *
+ * A wait this plugin owns used to be invisible: the built-in `llm-retry`
+ * appends `llm/retry` before its wait and `llm/retry-started` after it, and the
+ * console's chat view renders those records as a `model-retry` card with a live
+ * countdown (`Date.now() + delayMs`) and the attempt number. This plugin waits
+ * just as patiently but wrote nothing, so the user saw a stall with no card.
+ * Journalling the same two records under our own `policyKey` gives the card
+ * without touching the console, and makes each wait auditable after the fact.
+ *
+ * The numbering follows the invariant, not our retry budget: `retry` must be
+ * `1 +` the previous record for the same turn/step/provider/policyKey, and the
+ * `retryId` must persist across that chain. Our budget counts per turn (with
+ * `acrossSteps`), so a chain that spans steps restarts its display at 1 in each
+ * new step — the invariant's rule, stated here because it is visible in the UI.
+ */
+export function createRetryJournal(onError) {
+  const chains = new Map()
+  const report = typeof onError === 'function' ? onError : () => {}
+
+  /** Append one durable record, reporting rather than throwing on refusal. */
+  function append(session, type, data) {
+    try {
+      session.append(type, data)
+      return true
+    } catch (error) {
+      report(type + ' refused: ' + (error instanceof Error ? error.message : String(error)))
+      return false
+    }
+  }
+
+  /**
+   * The prior record for this exact chain, read from durable history rather than
+   * our map: a resumed session must continue the chain instead of restarting at
+   * 1, and the invariant computes its expectation the same way.
+   */
+  function priorAttempt(session, entry, policyKey) {
+    if (typeof session.snapshotEvents !== 'function') return undefined
+    const events = session.snapshotEvents()
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]
+      if (event.type !== 'llm/retry') continue
+      if (event.data.turn !== entry.turn || event.data.step !== entry.step) continue
+      if (event.data.provider !== entry.provider || event.data.policyKey !== policyKey) continue
+      return event.data
+    }
+    return undefined
+  }
+
+  return {
+    /** Drop every chain: budgets are per turn, and so are the chains. */
+    clear() {
+      chains.clear()
+    },
+    /**
+     * Record a scheduled attempt BEFORE its wait, exactly as the built-in does.
+     * @returns `{ retryId, retry }` to hand to `markStarted`, or undefined when
+     * no session was reachable or the durable boundary refused the record.
+     */
+    schedule(session, entry, policyKey, delayMs, maxRetries, fallbackCode) {
+      if (session === undefined || session === null || typeof session.append !== 'function') {
+        return undefined
+      }
+      const key = entry.turn + ':' + entry.step + ':' + entry.provider + ':' + policyKey
+      const cached = chains.get(key)
+      let state
+      if (cached !== undefined) {
+        state = { retryId: cached.retryId, retry: cached.retry + 1 }
+      } else {
+        const prior = priorAttempt(session, entry, policyKey)
+        state = prior === undefined
+          ? { retryId: mintRetryId(), retry: 1 }
+          : { retryId: prior.retryId, retry: prior.retry + 1 }
+      }
+      chains.set(key, state)
+      const data = {
+        retryId: state.retryId,
+        turn: entry.turn,
+        step: entry.step,
+        provider: entry.provider,
+        mode: 'normal',
+        policyKey,
+        retry: state.retry,
+        maxRetries,
+        delayMs,
+        failure: sanitizeFailure(entry.failure, fallbackCode),
+      }
+      if (!append(session, 'llm/retry', data)) {
+        chains.delete(key)
+        return undefined
+      }
+      return { retryId: state.retryId, retry: state.retry }
+    },
+    /** Close the wait: pair the scheduled attempt, so the card stops counting. */
+    markStarted(session, chain, entry) {
+      if (session === undefined || session === null || typeof session.append !== 'function') return
+      append(session, 'llm/retry-started', {
+        retryId: chain.retryId,
+        turn: entry.turn,
+        step: entry.step,
+        retry: chain.retry,
+      })
+    },
+  }
+}
+
+/** The durable session behind one recovery payload, when the emitter supplied it. */
+function sessionOf(payload) {
+  const agent = payload.agent
+  if (agent === undefined || agent === null) return undefined
+  return agent.session
+}
+
 export function apply(ctx, config) {
   const options = resolveOptions(config)
   const { maxRetries } = options
   const log = loggerFor(ctx)
   const stats = createStats()
+  /** Durable retry records, so the console renders a countdown card for each wait. */
+  const journal = createRetryJournal((message) => log.warn('llm/retry journal: ' + message))
   /** Attempts already spent, per counter key. */
   const counters = new Map()
   /** Last capacity-cooldown timestamp per provider, for the mislabeled-400 gate. */
@@ -476,12 +646,15 @@ export function apply(ctx, config) {
   /**
    * The shared tail of both policies: wait, then claim the retry. An aborted
    * turn resolves `undefined`, which the waterfall treats as "no action".
+   * `afterWait` closes the durable record only when the wait actually finished —
+   * an aborted wait never started the attempt, so it must stay unpaired.
    */
-  function waitAndRetry(payload, wait) {
+  function waitAndRetry(payload, wait, afterWait) {
     const { signal } = payload
     return (async () => {
       const ok = await cancellableDelay(wait, signal)
       if (!ok) return undefined
+      if (afterWait !== undefined) afterWait()
       return { kind: 'retry' }
     })()
   }
@@ -496,6 +669,7 @@ export function apply(ctx, config) {
     if (turn === currentTurn) return
     currentTurn = turn
     counters.clear()
+    journal.clear()
     stats.resetSession()
   }
 
@@ -573,7 +747,18 @@ export function apply(ctx, config) {
       + ' (' + attempt + '/' + maxRetries + ')'
       + (plan.source === 'backoff' ? ' — no hint, exponential fallback' : ''))
 
-    return waitAndRetry(payload, wait)
+    const session = sessionOf(payload)
+    const chain = journal.schedule(
+      session,
+      { ...owner, failure: payload.failure },
+      CAPACITY_POLICY_KEY,
+      wait,
+      maxRetries,
+      CAPACITY_FALLBACK_CODE,
+    )
+    return waitAndRetry(payload, wait, chain === undefined
+      ? undefined
+      : () => journal.markStarted(session, chain, owner))
   }
 
   /**
@@ -624,7 +809,18 @@ export function apply(ctx, config) {
       + ' — treating it as circuit replay, retrying in ' + plan.delayMs + 'ms'
       + ' (' + attempt + '/' + options.mislabeledMaxRetries + ')')
 
-    return waitAndRetry(payload, plan.delayMs)
+    const session = sessionOf(payload)
+    const chain = journal.schedule(
+      session,
+      { ...owner, failure: payload.failure },
+      MISLABELED_POLICY_KEY,
+      plan.delayMs,
+      options.mislabeledMaxRetries,
+      MISLABELED_FALLBACK_CODE,
+    )
+    return waitAndRetry(payload, plan.delayMs, chain === undefined
+      ? undefined
+      : () => journal.markStarted(session, chain, owner))
   }
 
   /**

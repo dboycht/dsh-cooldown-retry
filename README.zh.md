@@ -70,6 +70,19 @@ DSH 其实**能**用上这个提示，但只有一条很窄的路径：
 [cooldown-retry] upstream cooling down for nuaa (turn 3 step 2): retrying in 28000ms (1/5)
 ```
 
+### 界面上的倒计时卡片
+
+每次等待还会在**开始前**往会话里写一条持久记录，正常结束时补一条收尾记录，与内置 `llm-retry` 完全同构：
+
+| 记录 | 时机 | 关键字段 |
+|---|---|---|
+| `llm/retry` | 等待开始前 | `retryId` `turn` `step` `provider` `policyKey` `retry` `maxRetries` `delayMs` `failure` |
+| `llm/retry-started` | 等待正常结束 | `retryId` `turn` `step` `retry` |
+
+于是会话界面用它自己的 **model-retry 卡片**渲染这次等待——实时倒计时加第几次，例如「约 30 秒后重试（第 1/5 次）」。**这正是「插件在等 30 秒」在界面上的样子，不需要任何客户端代码。** 被中断的等待只留下排期记录、不写收尾记录，因为那次尝试从未开始。
+
+两条链各有 `policyKey`（`cooldown-retry/capacity` 与 `cooldown-retry/mislabeled`），编号按会话历史而不是内存计数器推导，所以插件重挂或会话恢复之后接着数，而不是从 1 重来。这些记录受 `dsh-llm-retry` **自己的不变式**校验：字段不合规会被它拒绝。本仓库用 `test/journal.test.js` 钉住形状，另有一份契约校验脚本用真实的那个不变式跑一遍。
+
 在输入框里执行 `/cooldown-retry` 会打印计数器：
 
 ```
@@ -125,6 +138,8 @@ dsh plugin --profile web remove dsh-cooldown-retry
 如果之前加过 `- id: cooldown-retry` 覆盖行，记得从 patch 层里删掉。
 
 ## 可选：浮动倒计时徽标
+
+**倒计时本身已经是永久行的能力**：每次等待都会写 `llm/retry` 记录，由会话界面渲染成 model-retry 卡片（见上面「界面上的倒计时卡片」）。下面这个东西因此只是可选装饰。
 
 [`dynamic/`](dynamic/) 里是给 DSH **动态 Cordis 插件**路径用的两半版本，会在窗口底部显示一个小徽标——*「上游冷却中，约 23 秒后自动重试（第 1/5 次）」*。
 

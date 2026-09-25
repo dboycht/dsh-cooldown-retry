@@ -1,5 +1,7 @@
 # Optional: the floating countdown badge
 
+**Superseded for visibility.** The permanent package root now journals every wait as the built-in's own `llm/retry` + `llm/retry-started` records, so the console renders a model-retry card with a live countdown and the attempt number on its own (see "The countdown card in the UI" in the main README). The badge below is a second, optional way to show the same thing — and it only appears while *it* owns the wait, see the last section.
+
 This folder is an **add-on**, not an alternative to the package root. It shows a small pill at the bottom of the window while a retry is pending:
 
 > ● 上游冷却中，约 23 秒后自动重试（第 1/5 次）
@@ -11,7 +13,7 @@ The badge needs two things that exist **only** for dynamic Cordis plugins:
 - `harness.handle` — the host half publishes a package-private `retry-status` method;
 - `host.call` — the client half polls it from the browser every 500 ms.
 
-Neither builtin is available to a permanent composition row, which is why the installable bundle (`index.js`) deliberately ships without a badge and reports through `console` logs instead.
+Neither builtin is available to a permanent composition row. (The permanent row does not need them for a countdown: its durable `llm/retry` records are what the console's own card renders.)
 
 A dynamic plugin is also **process-local**: it is gone after a restart. Use it beside the permanent row, never instead of it.
 

@@ -106,6 +106,19 @@ Every wait and give-up goes through `ctx.logger` under the `cooldown-retry` name
 [cooldown-retry] upstream cooling down for nuaa (turn 3 step 2): retrying in 28000ms (1/5)
 ```
 
+### The countdown card in the UI
+
+Each wait also writes a durable record **before** it starts and closes it when the wait finishes, matching the built-in `llm-retry` exactly:
+
+| Record | When | Fields |
+|---|---|---|
+| `llm/retry` | before the wait | `retryId` `turn` `step` `provider` `policyKey` `retry` `maxRetries` `delayMs` `failure` |
+| `llm/retry-started` | after a completed wait | `retryId` `turn` `step` `retry` |
+
+The console's chat view therefore renders this wait through its own **model-retry card**: a live countdown plus the attempt number — *"retrying in about 30 s (1/5)"*. **That is what a patient wait looks like in the UI, with no client code at all.** An aborted wait leaves only the scheduled record, because that attempt never started.
+
+The two policies own separate chains (`policyKey` `cooldown-retry/capacity` and `cooldown-retry/mislabeled`), and the numbering is derived from session history rather than an in-memory counter, so a plugin remount or a resumed session continues the chain instead of restarting at 1. `dsh-llm-retry`'s **own invariant** validates these records and rejects a malformed one; this repository pins the shape in `test/journal.test.js` and a contract-check script drives the real invariant.
+
 In the composer, `/cooldown-retry` prints the counters:
 
 ```
@@ -125,6 +138,8 @@ dsh plugin --profile web remove dsh-cooldown-retry
 Then drop the `- id: cooldown-retry` override from your patch layer if you added one.
 
 ## Optional: floating countdown badge
+
+**The countdown is already a capability of the permanent row**: every wait writes an `llm/retry` record that the console renders as its model-retry card (see "The countdown card in the UI" above). What follows is therefore a cosmetic add-on.
 
 [`dynamic/`](dynamic/) holds a two-half version for DSH's **dynamic Cordis plugin** path. It adds a small floating badge at the bottom of the window — *"cooling down, retrying in 23 s (1/5)"* — while a retry is pending.
 
